@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Kiro adoption metrics: S3 bucket for Kiro per-user activity reports, a Glue
+  crawler that tracks the daily-changing schema, and an Athena workgroup with
+  saved queries for active rate, depth, turns per conversation, model mix,
+  and burn rate. Deploy in the account and Region where Kiro users are
+  subscribed (the Region of your Kiro profile).
+
+Parameters:
+  ReportPrefix:
+    Type: String
+    Default: kiro-reports
+    AllowedPattern: "^[a-z0-9][a-z0-9-_/]*[a-z0-9]$"
+    Description: >-
+      Prefix (subfolder) Kiro writes under. Kiro cannot write to the bucket
+      root. Enter the S3 URI s3://<ReportBucketName>/<ReportPrefix>/ in Kiro
+      Settings > Kiro user activity reports.
+  GlueDatabaseName:
+    Type: String
+    Default: kiro_usage
+    AllowedPattern: "^[a-z0-9_]+$"
+  CrawlerSchedule:
+    Type: String
+    Default: cron(30 3 * * ? *)
+    Description: Daily, after Kiro's 02:00 UTC report cycle.
+  AthenaResultsRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+
+Resources:
+  # ---------- Report bucket (Kiro writes here) ----------
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256   # SSE-S3; SSE-KMS would also need a key policy for the Kiro service principal
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+
+  ReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: KiroLogsWrite
+            Effect: Allow
+            Principal:
+              Service: q.amazonaws.com          # yes, still "q"
+            Action: s3:PutObject
+            Resource: !Sub "${ReportBucket.Arn}/${ReportPrefix}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:codewhisperer:${AWS::Region}:${AWS::AccountId}:*"   # and still "codewhisperer"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ReportBucket.Arn
+              - !Sub "${ReportBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------- Athena results bucket ----------
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResults
+            Status: Enabled
+            ExpirationInDays: !Ref AthenaResultsRetentionDays
+
+  # ---------- Glue catalog and crawler ----------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Kiro per-user activity reports
+
+  CrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: ReadKiroReports
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ReportBucket.Arn}/${ReportPrefix}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ReportBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub "${ReportPrefix}/*"
+
+  ReportCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Role: !GetAtt CrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: >-
+        Catalogs Kiro user_report CSVs. Model columns appear and disappear
+        daily, so the crawler updates the table schema on every run.
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${ReportBucket}/${ReportPrefix}/AWSLogs/${AWS::AccountId}/KiroLogs/user_report/"
+      Schedule:
+        ScheduleExpression: !Ref CrawlerSchedule
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Configuration: >-
+        {"Version":1.0,
+         "Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas"},
+         "CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"},
+                          "Tables":{"AddOrUpdateBehavior":"MergeNewColumns"}}}
+
+  # ---------- Athena workgroup and saved queries ----------
+  Workgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "kiro-adoption-${AWS::StackName}"
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  QueryDailyCheck:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 0 - Check rows per day
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        SELECT "date", COUNT(*) AS user_rows
+        FROM user_report
+        GROUP BY 1 ORDER BY 1 DESC LIMIT 7;
+
+  QueryModelColumns:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 1 - List model columns
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        -- keep the columns ending in _messages, except total_messages
+        SHOW COLUMNS IN user_report;
+
+  QueryActiveDepthTurns:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 2 - Active users, depth, turns per conversation (7 days)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        WITH daily AS (
+          SELECT userid, "date",
+                 SUM(total_messages)     AS messages,
+                 SUM(chat_conversations) AS conversations,
+                 SUM(credits_used)       AS credits
+          FROM user_report
+          WHERE CAST("date" AS date) >= current_date - INTERVAL '7' DAY
+          GROUP BY userid, "date"
+        )
+        SELECT
+          COUNT(DISTINCT userid)                             AS active_users,
+          approx_percentile(messages, 0.5)                   AS p50_messages_per_day,
+          approx_percentile(messages, 0.9)                   AS p90_messages_per_day,
+          SUM(messages) * 1.0 / NULLIF(SUM(conversations),0) AS turns_per_conversation,
+          SUM(credits)  * 1.0 / NULLIF(SUM(conversations),0) AS credits_per_conversation
+        FROM daily
+        WHERE messages > 0;
+
+  QueryModelMix:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 3 - Model mix (30 days) - edit the arrays first
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        -- Replace model_a / model_b with the column names from query 1.
+        SELECT m.model,
+               SUM(m.messages) AS messages,
+               ROUND(100.0 * SUM(m.messages) / SUM(SUM(m.messages)) OVER (), 1) AS pct
+        FROM user_report
+        CROSS JOIN UNNEST(
+          ARRAY['auto', 'model_a', 'model_b'],
+          ARRAY[auto_messages, model_a_messages, model_b_messages]
+        ) AS m(model, messages)
+        WHERE CAST("date" AS date) >= current_date - INTERVAL '30' DAY
+        GROUP BY m.model
+        ORDER BY messages DESC;
+
+  QueryBurnRate:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 4 - Burn rate and tier fit (month to date)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        -- When overage is off, overage_cap is the plan's included credits.
+        -- Sort ascending for tier fit.
+        WITH mtd AS (
+          SELECT userid, subscription_tier,
+                 SUM(credits_used) AS credits_mtd,
+                 MAX(overage_cap)  AS cap
+          FROM user_report
+          WHERE date_trunc('month', CAST("date" AS date)) = date_trunc('month', current_date)
+          GROUP BY userid, subscription_tier
+        )
+        SELECT userid, subscription_tier, credits_mtd, cap,
+               ROUND(100.0 * credits_mtd / NULLIF(cap,0), 1) AS pct_of_cap,
+               ROUND(cap / NULLIF(credits_mtd / day(current_date), 0), 1) AS projected_days_to_cap
+        FROM mtd
+        ORDER BY pct_of_cap DESC;
+
+Outputs:
+  KiroReportS3Uri:
+    Description: Paste into Kiro console > Settings > Kiro user activity reports > S3 location
+    Value: !Sub "s3://${ReportBucket}/${ReportPrefix}/"
+  CrawlerName:
+    Description: Run once after the first report lands, or wait for the schedule
+    Value: !Ref ReportCrawler
+  AthenaWorkgroup:
+    Value: !Ref Workgroup
+  GlueDatabase:
+    Value: !Ref GlueDatabase
