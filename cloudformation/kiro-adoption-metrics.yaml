@@ -200,7 +200,7 @@ Resources:
   QueryActiveDepthTurns:
     Type: AWS::Athena::NamedQuery
     Properties:
-      Name: 2 - Active users, depth, turns per conversation (7 days)
+      Name: 2 - Active users, depth, messages per conversation (7 days)
       Database: !Ref GlueDatabase
       WorkGroup: !Ref Workgroup
       QueryString: |
@@ -210,14 +210,19 @@ Resources:
                  SUM(chat_conversations) AS conversations,
                  SUM(credits_used)       AS credits
           FROM user_report
-          WHERE CAST("date" AS date) >= current_date - INTERVAL '7' DAY
+          -- last 7 complete UTC days; today's report hasn't landed yet
+          WHERE CAST("date" AS date) BETWEEN current_date - INTERVAL '7' DAY
+                                         AND current_date - INTERVAL '1' DAY
           GROUP BY userid, "date"
         )
         SELECT
           COUNT(DISTINCT userid)                             AS active_users,
           approx_percentile(messages, 0.5)                   AS p50_messages_per_day,
           approx_percentile(messages, 0.9)                   AS p90_messages_per_day,
-          SUM(messages) * 1.0 / NULLIF(SUM(conversations),0) AS turns_per_conversation,
+          approx_percentile(messages, 0.9) - approx_percentile(messages, 0.5) AS depth_gap,
+          approx_percentile(messages, 0.9) * 1.0
+            / NULLIF(approx_percentile(messages, 0.5), 0)   AS depth_ratio,
+          SUM(messages) * 1.0 / NULLIF(SUM(conversations),0) AS messages_per_conversation,
           SUM(credits)  * 1.0 / NULLIF(SUM(conversations),0) AS credits_per_conversation
         FROM daily
         WHERE messages > 0;
@@ -229,16 +234,18 @@ Resources:
       Database: !Ref GlueDatabase
       WorkGroup: !Ref Workgroup
       QueryString: |
-        -- Replace model_a / model_b with the column names from query 1.
+        -- model_a / model_b are placeholders. Replace them with the columns from query 1.
+        -- Re-run query 1 after new models launch; until the arrays are updated, new models are missing from the mix.
         SELECT m.model,
                SUM(m.messages) AS messages,
                ROUND(100.0 * SUM(m.messages) / SUM(SUM(m.messages)) OVER (), 1) AS pct
         FROM user_report
         CROSS JOIN UNNEST(
-          ARRAY['auto', 'model_a', 'model_b'],
-          ARRAY[auto_messages, model_a_messages, model_b_messages]
+          ARRAY['auto', 'model_a', 'model_b'],                      -- labels: replace
+          ARRAY[auto_messages, model_a_messages, model_b_messages]  -- columns: replace
         ) AS m(model, messages)
-        WHERE CAST("date" AS date) >= current_date - INTERVAL '30' DAY
+        WHERE CAST("date" AS date) BETWEEN current_date - INTERVAL '30' DAY
+                                       AND current_date - INTERVAL '1' DAY
         GROUP BY m.model
         ORDER BY messages DESC;
 
@@ -250,18 +257,22 @@ Resources:
       WorkGroup: !Ref Workgroup
       QueryString: |
         -- When overage is off, overage_cap is the plan's included credits.
-        -- Sort ascending for tier fit.
+        -- Sort ascending for tier fit: users consistently below 25% are candidates for a tier-fit review.
         WITH mtd AS (
           SELECT userid, subscription_tier,
-                 SUM(credits_used) AS credits_mtd,
-                 MAX(overage_cap)  AS cap
+                 SUM(credits_used)       AS credits_mtd,
+                 MAX(overage_cap)        AS cap,
+                 COUNT(DISTINCT "date")  AS active_days
           FROM user_report
           WHERE date_trunc('month', CAST("date" AS date)) = date_trunc('month', current_date)
+            AND credits_used > 0
           GROUP BY userid, subscription_tier
         )
-        SELECT userid, subscription_tier, credits_mtd, cap,
+        SELECT userid, subscription_tier, credits_mtd, cap, active_days,
                ROUND(100.0 * credits_mtd / NULLIF(cap,0), 1) AS pct_of_cap,
-               ROUND(cap / NULLIF(credits_mtd / day(current_date), 0), 1) AS projected_days_to_cap
+               -- estimate, not a forecast: assumes the current average daily pace continues
+               ROUND(cap / NULLIF(credits_mtd / GREATEST(day(current_date) - 1, 1), 0), 1)
+                 AS est_days_to_cap_at_current_avg
         FROM mtd
         ORDER BY pct_of_cap DESC;
 
