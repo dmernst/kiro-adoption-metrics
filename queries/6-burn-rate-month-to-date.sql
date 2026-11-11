@@ -1,13 +1,12 @@
--- 4 - Burn rate and tier fit (month to date)
+-- 6 - Burn rate (month to date)
 -- Database: kiro_usage (Glue), table: user_report
 -- Individual subscriptions with overage DISABLED only. Excludes subscription_tier = 'POOLING' (credit sharing reports overage_cap = 0).
 -- Credit sharing: no per-user cap; use the Kiro console Credit sharing dashboard.
--- Overage enabled: track overage_credits_used against the configured overage limit instead.
 -- IMPORTANT: assumes the billing cycle aligns with the calendar month. Adjust the window for subscriptions with different renewal dates.
--- Check credits_used and overage_cap are consistent across a user's IDE/CLI/Plugin rows.
 -- Before trusting this, verify overage_cap is constant per user this month:
 --   SELECT userid, COUNT(DISTINCT overage_cap) FROM user_report WHERE <this month> GROUP BY userid HAVING COUNT(DISTINCT overage_cap) > 1;
--- est_days_remaining is an estimate at the current average daily pace, not a forecast.
+-- Overage enabled: track overage_credits_used against the configured overage limit instead.
+-- est_days_remaining is an estimate at the current average daily pace, not a forecast. 75% of cap or more is "at risk".
 WITH mtd AS (
   SELECT userid, subscription_tier,
          SUM(credits_used)       AS credits_mtd,
@@ -23,13 +22,13 @@ WITH mtd AS (
 ), paced AS (
   SELECT *,
          credits_mtd / GREATEST(day(date(current_timestamp AT TIME ZONE 'UTC')) - 1, 1) AS avg_daily_credits,
-         GREATEST(cap - credits_mtd, 0)                   AS remaining_credits
+         GREATEST(cap - credits_mtd, 0)                   AS remaining_credits,
+         ROUND(100.0 * credits_mtd / NULLIF(cap, 0), 1)   AS pct_of_cap
   FROM mtd
 )
-SELECT userid, subscription_tier, credits_mtd, cap, active_days,
-       ROUND(100.0 * credits_mtd / NULLIF(cap, 0), 1)                 AS pct_of_cap,
+SELECT userid, subscription_tier, credits_mtd, cap, active_days, pct_of_cap,
        remaining_credits,
-       -- estimate, not a forecast: assumes the current average daily pace continues
-       ROUND(remaining_credits / NULLIF(avg_daily_credits, 0), 1)       AS est_days_remaining
+       ROUND(remaining_credits / NULLIF(avg_daily_credits, 0), 1) AS est_days_remaining,
+       pct_of_cap >= 75                                           AS at_risk
 FROM paced
 ORDER BY pct_of_cap DESC;

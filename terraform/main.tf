@@ -226,9 +226,10 @@ resource "aws_athena_workgroup" "kiro" {
 }
 
 locals {
+  # Saved query name = first line of each file ("-- <name>"), the same names CloudFormation uses
   queries = {
     for f in fileset("${path.module}/../queries", "*.sql") :
-    trimsuffix(f, ".sql") => file("${path.module}/../queries/${f}")
+    trimprefix(split("\n", file("${path.module}/../queries/${f}"))[0], "-- ") => file("${path.module}/../queries/${f}")
   }
 }
 

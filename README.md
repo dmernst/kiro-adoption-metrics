@@ -1,6 +1,6 @@
 # kiro-adoption-metrics
 
-Measure how your team uses Kiro, not just how much it spends. This repo turns Kiro's daily per-user activity report into Athena tables and five saved queries: active rate, depth, messages per conversation, model mix, and burn rate.
+Measure how your team uses Kiro, not just how much it spends. This repo turns Kiro's daily per-user activity report into an Athena table and saved queries for the seven adoption numbers in the blog post: 30-day active adoption, 7-day active rate, depth, messages per conversation, model mix, burn rate, and tier fit.
 
 Companion to the blog post: [YOUR POST LINK]
 
@@ -13,7 +13,7 @@ Everything runs in the AWS account and Region where your Kiro users are subscrib
 - **Report bucket** for Kiro's daily CSVs: Block Public Access, ACLs disabled, versioning, SSE-S3, TLS-only, and the Kiro write policy. Retained on delete, because it holds your history.
 - **Athena results bucket**, with results expiring after 30 days.
 - **Glue database and crawler**, scheduled at 03:30 UTC (after Kiro's 02:00 UTC report). It merges new model columns as they appear and keeps the IDE, CLI, and Plugin files in one table.
-- **Athena workgroup with five saved queries** (also in [`queries/`](queries/)).
+- **Athena workgroup with eight saved queries**: one for each of the seven numbers in the post, plus 5a, which lists the model columns that 5b (model mix) needs (also in [`queries/`](queries/)).
 
 ## Deploy
 
@@ -52,15 +52,18 @@ The report is written **once a day at 02:00 UTC**. It doesn't stream, and the sc
 
 ## Run the queries
 
-After the first file lands, start the crawler (or wait for 03:30 UTC), then open Athena, switch to the stack's workgroup, and run the saved queries in order:
+After the first file lands, start the crawler (or wait for 03:30 UTC), then open Athena and switch to the stack's workgroup. The query numbers match the seven numbers in the blog post.
 
 | Query | What it answers |
 |---|---|
-| `0-check-rows-per-day` | Is data landing every day? |
-| `1-list-model-columns` | Which `<model>_messages` columns exist today? Paste them into query 3. |
-| `2-active-users-depth-messages-per-conversation-7-days` | Unique active users, depth gap and ratio (per active user-day), and messages per conversation, a proxy for interaction depth. Last 7 complete UTC days. |
-| `3-model-mix-30-days-edit-the-arrays-first` | Share of messages by model. Runs as-is with `auto_messages`; add each other model column from query 1 to both arrays, and update after new models appear. |
-| `4-burn-rate-and-tier-fit-month-to-date` | **Individual subscriptions with overage disabled only.** Percent of cap, remaining credits, and estimated days remaining at the current average daily pace (an estimate, not a forecast). On credit sharing, there's no per-user cap: watch the shared pool in the Kiro console dashboard. |
+| `1 - 30-day active users` | Unique active users in the last 30 complete UTC days. Divide by assigned seats from Kiro Access management for 30-day active adoption. |
+| `2 - 7-day active users` | Unique active users in the last 7 complete UTC days. Divide by assigned seats for the 7-day active rate. |
+| `3 - Depth (7 days)` | p50 and p90 messages per active user-day, the gap and ratio between them, and the same percentiles per developer for the week. |
+| `4 - Messages per conversation (7 days)` | Messages and credits per conversation, a proxy for interaction depth. |
+| `5a - List model columns` | Which `<model>_messages` columns exist today? Add them to query 5b. |
+| `5b - Model mix (30 days) - add your model columns from 5a` | Share of messages by model. Runs as-is with `auto_messages`; add each other model column from 5a to both arrays, and update after new models appear. |
+| `6 - Burn rate (month to date)` | **Individual subscriptions with overage disabled only.** Percent of cap, remaining credits, estimated days remaining at the current pace (an estimate, not a forecast), and an at-risk flag at 75%. On credit sharing, watch the shared pool in the Kiro console dashboard instead. |
+| `7 - Tier fit (month to date)` | Same scope as query 6, sorted from lowest use up, with each developer labeled: under 25% (tier-fit review), 75%+ (capacity conversation), or right-sized. |
 
 ## Gotchas
 

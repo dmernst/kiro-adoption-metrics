@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Kiro adoption metrics: S3 bucket for Kiro per-user activity reports, a Glue
   crawler that tracks the daily-changing schema, and an Athena workgroup with
-  saved queries for active rate, depth, turns per conversation, model mix,
+  saved queries for active rate, depth, messages per conversation, model mix,
   and burn rate. Deploy in the account and Region where Kiro users are
   subscribed (the Region of your Kiro profile).
 
@@ -176,67 +176,77 @@ Resources:
           EncryptionConfiguration:
             EncryptionOption: SSE_S3
 
-  QueryDailyCheck:
-    Type: AWS::Athena::NamedQuery
-    Properties:
-      Name: 0 - Check rows per day
-      Database: !Ref GlueDatabase
-      WorkGroup: !Ref Workgroup
-      QueryString: |
-        SELECT "date", COUNT(*) AS user_rows
-        FROM user_report
-        GROUP BY 1 ORDER BY 1 DESC LIMIT 7;
-
   QueryModelColumns:
     Type: AWS::Athena::NamedQuery
     Properties:
-      Name: 1 - List model columns
+      Name: 5a - List model columns
       Database: !Ref GlueDatabase
       WorkGroup: !Ref Workgroup
       QueryString: |
         -- keep the columns ending in _messages, except total_messages
         SHOW COLUMNS IN user_report;
 
-  QueryActiveDepthTurns:
+  QueryActive30:
     Type: AWS::Athena::NamedQuery
     Properties:
-      Name: 2 - Active users, depth, messages per conversation (7 days)
+      Name: 1 - 30-day active users
       Database: !Ref GlueDatabase
       WorkGroup: !Ref Workgroup
       QueryString: |
-        -- Last 7 complete UTC days. Rows are per user, per day, per client; the daily CTE combines them.
+        -- Last 30 complete UTC days. Returns unique active users (the numerator).
+        -- Divide by assigned seats from Kiro Access management for the 30-day active adoption rate.
+        SELECT COUNT(DISTINCT userid) AS active_users_30d
+        FROM user_report
+        WHERE CAST("date" AS date) BETWEEN date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '30' DAY
+                                       AND date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '1' DAY
+          AND total_messages > 0;
+
+  QueryActive7:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 2 - 7-day active users
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        -- Last 7 complete UTC days; today's report hasn't landed yet.
         -- Returns unique active users (the numerator). Divide by assigned seats from Kiro Access management for the 7-day active rate.
+        SELECT COUNT(DISTINCT userid) AS active_users_7d
+        FROM user_report
+        WHERE CAST("date" AS date) BETWEEN date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '7' DAY
+                                       AND date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '1' DAY
+          AND total_messages > 0;
+
+  QueryDepth:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 3 - Depth (7 days)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        -- Last 7 complete UTC days.
         -- Day-level percentiles are over active user-days; per-developer percentiles are over people.
-        WITH daily AS (
+        -- A high day-level ratio with a narrow per-developer spread means intense days, not a concentrated team.
+        WITH daily AS (   -- one row per developer per day, IDE/CLI/Plugin rows combined
           SELECT userid, "date",
                  SUM(total_messages)     AS messages,
                  SUM(chat_conversations) AS conversations,
                  SUM(credits_used)       AS credits
           FROM user_report
-          -- last 7 complete UTC days; today's report hasn't landed yet
           WHERE CAST("date" AS date) BETWEEN date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '7' DAY
                                          AND date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '1' DAY
           GROUP BY userid, "date"
         ),
         active_days AS (SELECT * FROM daily WHERE messages > 0),
-        per_dev AS (   -- one row per developer for the week
-          SELECT userid, SUM(messages) AS week_messages FROM active_days GROUP BY userid
-        )
+        per_dev AS (SELECT userid, SUM(messages) AS week_messages FROM active_days GROUP BY userid)
         SELECT
-          d.active_users, d.p50_messages_per_day, d.p90_messages_per_day,
-          d.depth_gap, d.depth_ratio,
-          w.p50_week_messages_per_dev, w.p90_week_messages_per_dev,
-          d.messages_per_conversation, d.credits_per_conversation
+          d.p50_messages_per_day, d.p90_messages_per_day, d.depth_gap, d.depth_ratio,
+          w.p50_week_messages_per_dev, w.p90_week_messages_per_dev
         FROM (
-          SELECT
-            COUNT(DISTINCT userid)                                  AS active_users,
-            approx_percentile(messages, 0.5)                        AS p50_messages_per_day,
-            approx_percentile(messages, 0.9)                        AS p90_messages_per_day,
-            approx_percentile(messages, 0.9) - approx_percentile(messages, 0.5) AS depth_gap,
-            approx_percentile(messages, 0.9) * 1.0
-              / NULLIF(approx_percentile(messages, 0.5), 0)        AS depth_ratio,
-            SUM(messages) * 1.0 / NULLIF(SUM(conversations), 0)     AS messages_per_conversation,
-            SUM(credits)  * 1.0 / NULLIF(SUM(conversations), 0)     AS credits_per_conversation
+          SELECT approx_percentile(messages, 0.5)                        AS p50_messages_per_day,
+                 approx_percentile(messages, 0.9)                        AS p90_messages_per_day,
+                 approx_percentile(messages, 0.9) - approx_percentile(messages, 0.5) AS depth_gap,
+                 approx_percentile(messages, 0.9) * 1.0
+                   / NULLIF(approx_percentile(messages, 0.5), 0)        AS depth_ratio
           FROM active_days
         ) d
         CROSS JOIN (
@@ -245,22 +255,48 @@ Resources:
           FROM per_dev
         ) w;
 
+  QueryMessagesPerConversation:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 4 - Messages per conversation (7 days)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        -- Last 7 complete UTC days. Messages include prompts, tool calls, and responses,
+        -- so this is a proxy for interaction depth, not literal back-and-forth turns.
+        WITH daily AS (   -- one row per developer per day, IDE/CLI/Plugin rows combined
+          SELECT userid, "date",
+                 SUM(total_messages)     AS messages,
+                 SUM(chat_conversations) AS conversations,
+                 SUM(credits_used)       AS credits
+          FROM user_report
+          WHERE CAST("date" AS date) BETWEEN date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '7' DAY
+                                         AND date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '1' DAY
+          GROUP BY userid, "date"
+        ),
+        active_days AS (SELECT * FROM daily WHERE messages > 0)
+        SELECT SUM(conversations)                                    AS conversations,
+               SUM(messages)                                         AS messages,
+               ROUND(SUM(messages) * 1.0 / NULLIF(SUM(conversations), 0), 1) AS messages_per_conversation,
+               ROUND(SUM(credits)  * 1.0 / NULLIF(SUM(conversations), 0), 1) AS credits_per_conversation
+        FROM active_days;
+
   QueryModelMix:
     Type: AWS::Athena::NamedQuery
     Properties:
-      Name: 3 - Model mix (30 days) - add your model columns
+      Name: 5b - Model mix (30 days) - add your model columns from 5a
       Database: !Ref GlueDatabase
       WorkGroup: !Ref Workgroup
       QueryString: |
         -- Runs as-is against a table with only auto_messages.
-        -- For each other <model>_messages column from query 1, add a label to the first array and the column to the second, same order.
+        -- For each other <model>_messages column from query 5a, add a label to the first array and the column to the second, same order.
         -- Until every model column is included, treat the result as a partial breakdown.
         SELECT m.model,
                SUM(m.messages) AS messages,
                ROUND(100.0 * SUM(m.messages) / SUM(SUM(m.messages)) OVER (), 1) AS pct
         FROM user_report
         CROSS JOIN UNNEST(
-          ARRAY['auto'],          -- add one label per model column from query 1
+          ARRAY['auto'],          -- add one label per model column from query 5a
           ARRAY[auto_messages]    -- add the matching <model>_messages column, same order
         ) AS m(model, messages)
         WHERE CAST("date" AS date) BETWEEN date(current_timestamp AT TIME ZONE 'UTC') - INTERVAL '30' DAY
@@ -271,18 +307,17 @@ Resources:
   QueryBurnRate:
     Type: AWS::Athena::NamedQuery
     Properties:
-      Name: 4 - Burn rate and tier fit (month to date)
+      Name: 6 - Burn rate (month to date)
       Database: !Ref GlueDatabase
       WorkGroup: !Ref Workgroup
       QueryString: |
         -- Individual subscriptions with overage DISABLED only. Excludes subscription_tier = 'POOLING' (credit sharing reports overage_cap = 0).
         -- Credit sharing: no per-user cap; use the Kiro console Credit sharing dashboard.
-        -- Overage enabled: track overage_credits_used against the configured overage limit instead.
         -- IMPORTANT: assumes the billing cycle aligns with the calendar month. Adjust the window for subscriptions with different renewal dates.
-        -- Check credits_used and overage_cap are consistent across a user's IDE/CLI/Plugin rows.
         -- Before trusting this, verify overage_cap is constant per user this month:
         --   SELECT userid, COUNT(DISTINCT overage_cap) FROM user_report WHERE <this month> GROUP BY userid HAVING COUNT(DISTINCT overage_cap) > 1;
-        -- est_days_remaining is an estimate at the current average daily pace, not a forecast.
+        -- Overage enabled: track overage_credits_used against the configured overage limit instead.
+        -- est_days_remaining is an estimate at the current average daily pace, not a forecast. 75% of cap or more is "at risk".
         WITH mtd AS (
           SELECT userid, subscription_tier,
                  SUM(credits_used)       AS credits_mtd,
@@ -298,16 +333,55 @@ Resources:
         ), paced AS (
           SELECT *,
                  credits_mtd / GREATEST(day(date(current_timestamp AT TIME ZONE 'UTC')) - 1, 1) AS avg_daily_credits,
-                 GREATEST(cap - credits_mtd, 0)                   AS remaining_credits
+                 GREATEST(cap - credits_mtd, 0)                   AS remaining_credits,
+                 ROUND(100.0 * credits_mtd / NULLIF(cap, 0), 1)   AS pct_of_cap
           FROM mtd
         )
-        SELECT userid, subscription_tier, credits_mtd, cap, active_days,
-               ROUND(100.0 * credits_mtd / NULLIF(cap, 0), 1)                 AS pct_of_cap,
+        SELECT userid, subscription_tier, credits_mtd, cap, active_days, pct_of_cap,
                remaining_credits,
-               -- estimate, not a forecast: assumes the current average daily pace continues
-               ROUND(remaining_credits / NULLIF(avg_daily_credits, 0), 1)       AS est_days_remaining
+               ROUND(remaining_credits / NULLIF(avg_daily_credits, 0), 1) AS est_days_remaining,
+               pct_of_cap >= 75                                           AS at_risk
         FROM paced
         ORDER BY pct_of_cap DESC;
+
+  QueryTierFit:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 7 - Tier fit (month to date)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref Workgroup
+      QueryString: |
+        -- Individual subscriptions with overage DISABLED only. Excludes subscription_tier = 'POOLING' (credit sharing reports overage_cap = 0).
+        -- Credit sharing: no per-user cap; use the Kiro console Credit sharing dashboard.
+        -- IMPORTANT: assumes the billing cycle aligns with the calendar month. Adjust the window for subscriptions with different renewal dates.
+        -- Before trusting this, verify overage_cap is constant per user this month:
+        --   SELECT userid, COUNT(DISTINCT overage_cap) FROM user_report WHERE <this month> GROUP BY userid HAVING COUNT(DISTINCT overage_cap) > 1;
+        -- Run it late in the month, or over several months: one quiet week isn't a tier problem.
+        WITH mtd AS (
+          SELECT userid, subscription_tier,
+                 SUM(credits_used)       AS credits_mtd,
+                 MAX(overage_cap)        AS cap,
+                 COUNT(DISTINCT "date")  AS active_days
+          FROM user_report
+          WHERE date_trunc('month', CAST("date" AS date)) = date_trunc('month', date(current_timestamp AT TIME ZONE 'UTC'))
+            AND CAST("date" AS date) < date(current_timestamp AT TIME ZONE 'UTC')          -- complete UTC days only
+            AND credits_used > 0
+            AND overage_enabled = false                -- overage-disabled users only
+            AND subscription_tier <> 'POOLING'      -- credit sharing has no per-user cap
+          GROUP BY userid, subscription_tier
+        ), paced AS (
+          SELECT *,
+                 credits_mtd / GREATEST(day(date(current_timestamp AT TIME ZONE 'UTC')) - 1, 1) AS avg_daily_credits,
+                 GREATEST(cap - credits_mtd, 0)                   AS remaining_credits,
+                 ROUND(100.0 * credits_mtd / NULLIF(cap, 0), 1)   AS pct_of_cap
+          FROM mtd
+        )
+        SELECT userid, subscription_tier, credits_mtd, cap, active_days, pct_of_cap,
+               CASE WHEN pct_of_cap < 25  THEN 'Under 25%: tier-fit review'
+                    WHEN pct_of_cap >= 75 THEN '75%+: capacity conversation'
+                    ELSE 'Right-sized' END                                  AS tier_fit
+        FROM paced
+        ORDER BY pct_of_cap ASC;
 
 Outputs:
   KiroReportS3Uri:
