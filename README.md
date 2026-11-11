@@ -59,7 +59,7 @@ After the first file lands, start the crawler (or wait for 03:30 UTC), then open
 | `0-check-rows-per-day` | Is data landing every day? |
 | `1-list-model-columns` | Which `<model>_messages` columns exist today? Paste them into query 3. |
 | `2-active-users-depth-messages-per-conversation-7-days` | Unique active users, depth gap and ratio (per active user-day), and messages per conversation, a proxy for interaction depth. Last 7 complete UTC days. |
-| `3-model-mix-30-days-edit-the-arrays-first` | Share of messages by model. `model_a`/`model_b` are placeholders: replace them with query 1's columns, and update after new models appear. |
+| `3-model-mix-30-days-edit-the-arrays-first` | Share of messages by model. Runs as-is with `auto_messages`; add each other model column from query 1 to both arrays, and update after new models appear. |
 | `4-burn-rate-and-tier-fit-month-to-date` | **Individual subscriptions with overage disabled only.** Percent of cap, remaining credits, and estimated days remaining at the current average daily pace (an estimate, not a forecast). On credit sharing, there's no per-user cap: watch the shared pool in the Kiro console dashboard. |
 
 ## Gotchas
